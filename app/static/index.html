@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoiceDesk AI — Receptionist MVP</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark">V</div>
+    <div>
+      <div class="brand-name">VoiceDesk AI</div>
+      <div class="brand-subtitle">Your business, ready to talk</div>
+    </div>
+    <span id="healthBadge" class="status">Checking API…</span>
+  </header>
+
+  <main class="layout">
+    <section class="intro">
+      <p class="eyebrow">BROWSER VOICE MVP · V0.1</p>
+      <h1>Your AI receptionist,<br><span>configured by you.</span></h1>
+      <p class="intro-copy">Add your business information, save it, and test how your receptionist answers in English or Tamil. This prototype uses saved records—not live calendars.</p>
+      <div class="notice"><strong>Prototype note</strong><br>Voice input needs browser permission. Spoken voice quality depends on voices installed on this device.</div>
+    </section>
+
+    <section class="panel config-panel">
+      <div class="section-heading">
+        <div><p class="eyebrow">01 / BUSINESS PROFILE</p><h2>Teach your receptionist</h2></div>
+        <span class="step-dot">01</span>
+      </div>
+      <form id="businessForm">
+        <label>Business name<input id="businessName" required maxlength="160" value="ABC Dental Clinic"></label>
+        <label>About the business<textarea id="description" rows="2" maxlength="2000"></textarea></label>
+        <div class="two-col">
+          <label>Address<input id="address" maxlength="500"></label>
+          <label>Opening hours<input id="hours" maxlength="300"></label>
+        </div>
+        <label>Services — one per line <span class="hint">Name | price | duration | description</span>
+          <textarea id="services" rows="4" placeholder="Teeth cleaning | ₹1500 | 30 minutes | Cleaning and polishing"></textarea>
+        </label>
+        <label>Doctors — one per line <span class="hint">Name | specialty | availability</span>
+          <textarea id="doctors" rows="3" placeholder="Dr. Priya | Dentist | Monday-Saturday, 9 AM-1 PM"></textarea>
+        </label>
+        <label>FAQs — one per line <span class="hint">Question | answer</span>
+          <textarea id="faqs" rows="3" placeholder="Do you accept walk-ins? | Please call before visiting."></textarea>
+        </label>
+        <label>Default language
+          <select id="defaultLanguage"><option value="en-IN">English (India)</option><option value="ta-IN">Tamil (India)</option></select>
+        </label>
+        <button class="primary" type="submit">Save business details <span>↗</span></button>
+        <p id="saveStatus" class="small-status" role="status"></p>
+      </form>
+    </section>
+
+    <section class="panel voice-panel">
+      <div class="section-heading">
+        <div><p class="eyebrow">02 / LIVE TEST</p><h2>Talk to your receptionist</h2></div>
+        <span class="live-pill"><i></i> LOCAL TEST</span>
+      </div>
+      <div class="chat-toolbar">
+        <label class="language-label">Conversation language
+          <select id="chatLanguage"><option value="en-IN">English</option><option value="ta-IN">தமிழ் (Tamil)</option></select>
+        </label>
+        <button type="button" class="secondary" id="clearChat">Clear chat</button>
+      </div>
+      <div id="chatLog" class="chat-log" aria-live="polite">
+        <div class="message assistant"><div class="avatar">V</div><div><span class="speaker">VoiceDesk AI</span><p>Hi! I'm your test receptionist. Ask me about services, prices, doctors or opening hours.</p></div></div>
+      </div>
+      <form id="chatForm" class="chat-form">
+        <input id="chatInput" autocomplete="off" placeholder="Ask about a service or price…" maxlength="2000" required>
+        <button type="submit" class="send-button" aria-label="Send message">↑</button>
+      </form>
+      <div class="voice-controls">
+        <button type="button" class="mic-button" id="micButton"><span class="mic-icon">🎙</span><span id="micText">Speak to receptionist</span></button>
+        <button type="button" class="secondary" id="stopSpeech">Stop voice</button>
+      </div>
+      <p id="voiceStatus" class="small-status" role="status">Use Chrome or Edge for browser speech recognition.</p>
+      <p class="disclaimer">Prototype only. Doctor availability is descriptive text; no real appointment is checked or booked.</p>
+    </section>
+  </main>
+  <footer>VoiceDesk AI · Minimal working foundation · No phone integration yet</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>
