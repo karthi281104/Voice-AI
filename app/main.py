@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 
 import httpx
 from contextlib import contextmanager
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -72,6 +73,7 @@ class ChatResponse(BaseModel):
     source: str = Field(description="Source identifier: 'llm', 'service', 'doctor', 'faq', 'business', 'greeting', or 'fallback'")
     model: str | None = Field(default=None, description="Active LLM model if engine is llm")
     business_name: str
+    response_time_ms: float = Field(default=0.0, description="Server turnaround time in milliseconds")
 
 
 def check_ollama_status() -> dict[str, Any]:
@@ -497,8 +499,91 @@ def update_business(profile: BusinessProfile) -> dict[str, Any]:
     return save_profile(profile)
 
 
+def stream_chat_response(request: ChatRequest, profile: dict[str, Any]):
+    t0 = time.perf_counter()
+    ollama_ok = False
+    try:
+        check = httpx.get(f"{OLLAMA_BASE_URL.rstrip('/')}/api/tags", timeout=1.5)
+        ollama_ok = check.status_code == 200
+    except Exception:
+        ollama_ok = False
+
+    if ollama_ok:
+        system_prompt = build_system_prompt(profile, request.language)
+        ollama_messages = [{"role": "system", "content": system_prompt}]
+        if request.history:
+            for item in request.history[-6:]:
+                if item.content.strip():
+                    ollama_messages.append({"role": item.role, "content": item.content.strip()})
+        ollama_messages.append({"role": "user", "content": request.message.strip()})
+
+        accumulated: list[str] = []
+        try:
+            with httpx.stream(
+                "POST",
+                f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "stream": True,
+                    "messages": ollama_messages,
+                    "options": {"temperature": 0.2, "num_predict": 250},
+                },
+                timeout=OLLAMA_TIMEOUT_SECONDS,
+            ) as r:
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                        msg = chunk.get("message", {})
+                        content_piece = msg.get("content", "")
+                        if content_piece:
+                            clean_piece = re.sub(r"</?think>", "", content_piece)
+                            if clean_piece:
+                                accumulated.append(clean_piece)
+                                yield json.dumps({"type": "token", "content": clean_piece}) + "\n"
+                        if chunk.get("done", False):
+                            break
+                    except Exception:
+                        continue
+
+            if accumulated:
+                full_text = "".join(accumulated).strip()
+                if not re.search(r"^(Step \d|We are given|The user asks|Let me check)", full_text, flags=re.IGNORECASE):
+                    duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+                    yield json.dumps({
+                        "type": "done",
+                        "answer": full_text,
+                        "engine": "llm",
+                        "source": "llm",
+                        "model": OLLAMA_MODEL,
+                        "business_name": profile["name"],
+                        "response_time_ms": duration_ms,
+                    }) + "\n"
+                    return
+        except Exception:
+            pass
+
+    # Deterministic rule engine fallback
+    answer, engine, source, model = answer_question_rules(
+        request.message, request.language, profile, request.history
+    )
+    duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+    yield json.dumps({"type": "token", "content": answer}) + "\n"
+    yield json.dumps({
+        "type": "done",
+        "answer": answer,
+        "engine": engine,
+        "source": source,
+        "model": model,
+        "business_name": profile["name"],
+        "response_time_ms": duration_ms,
+    }) + "\n"
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
+    t0 = time.perf_counter()
     profile = get_profile()
     answer, engine, source, model = answer_question(
         request.message,
@@ -506,10 +591,21 @@ def chat(request: ChatRequest) -> ChatResponse:
         profile,
         request.history,
     )
+    duration_ms = round((time.perf_counter() - t0) * 1000, 1)
     return ChatResponse(
         answer=answer,
         engine=engine,
         source=source,
         model=model,
         business_name=profile["name"],
+        response_time_ms=duration_ms,
+    )
+
+
+@app.post("/api/chat/stream")
+def chat_stream(request: ChatRequest) -> StreamingResponse:
+    profile = get_profile()
+    return StreamingResponse(
+        stream_chat_response(request, profile),
+        media_type="application/x-ndjson",
     )

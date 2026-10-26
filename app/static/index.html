@@ -59,8 +59,14 @@
         <span class="live-pill"><i></i> LOCAL TEST</span>
       </div>
       <div class="chat-toolbar">
-        <label class="language-label">Conversation language
-          <select id="chatLanguage"><option value="en-IN">English</option><option value="ta-IN">தமிழ் (Tamil)</option></select>
+        <label class="language-label">Language
+          <select id="chatLanguage"><option value="en-IN">English (India)</option><option value="ta-IN">தமிழ் (Tamil)</option></select>
+        </label>
+        <label class="voice-label">Voice
+          <div class="voice-select-wrap">
+            <select id="voiceSelect"><option value="">Detecting natural voices…</option></select>
+            <button type="button" class="test-voice-btn" id="testVoiceBtn" title="Test selected voice">🔊</button>
+          </div>
         </label>
         <button type="button" class="secondary" id="clearChat">Clear chat</button>
       </div>
@@ -73,9 +79,13 @@
       </form>
       <div class="voice-controls">
         <button type="button" class="mic-button" id="micButton"><span class="mic-icon">🎙</span><span id="micText">Speak to receptionist</span></button>
-        <button type="button" class="secondary" id="stopSpeech">Stop voice</button>
+        <button type="button" class="secondary interrupt-button" id="stopSpeech" title="Interrupt speech playback (or press Space)">⏹️ Interrupt voice</button>
       </div>
-      <p id="voiceStatus" class="small-status" role="status">Use Chrome or Edge for browser speech recognition.</p>
+      <div id="latencyBar" class="latency-bar" style="display:none;">
+        <span class="latency-tag" id="latencyTurnaround">⏱️ Turnaround: --</span>
+        <span class="latency-breakdown" id="latencyBreakdown">API: -- · Audio: --</span>
+      </div>
+      <p id="voiceStatus" class="small-status" role="status">Use Chrome or Edge for natural browser voice. Press Space or speak to interrupt.</p>
       <p class="disclaimer">Prototype only. Doctor availability is descriptive text; no real appointment is checked or booked.</p>
     </section>
   </main>
