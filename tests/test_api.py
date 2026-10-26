@@ -16,10 +16,13 @@ client = TestClient(app)
 
 
 class VoiceDeskAPITests(unittest.TestCase):
-    def test_health_reports_database(self):
+    def test_health_reports_database_and_ollama(self):
         response = client.get("/api/health")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "ok")
+        self.assertEqual(response.json()["database"], "connected")
+        self.assertIn("ollama", response.json())
+        self.assertIn("engine", response.json())
 
     def test_business_profile_can_be_saved_and_loaded(self):
         profile = {
@@ -43,12 +46,17 @@ class VoiceDeskAPITests(unittest.TestCase):
         response = client.post("/api/chat", json={"message": "How much does Cleaning cost?", "language": "en-IN"})
         self.assertEqual(response.status_code, 200)
         self.assertIn("₹1000", response.json()["answer"])
-        self.assertEqual(response.json()["source"], "service")
+        self.assertIn(response.json()["source"], ["llm", "service"])
+        self.assertIn(response.json()["engine"], ["llm", "rule_based"])
 
     def test_unknown_question_does_not_invent_answer(self):
         response = client.post("/api/chat", json={"message": "Do you have an MRI machine?", "language": "en-IN"})
         self.assertEqual(response.status_code, 200)
-        self.assertIn("can't confirm", response.json()["answer"])
+        answer_lower = response.json()["answer"].lower()
+        self.assertTrue(
+            "can't confirm" in answer_lower or "cannot confirm" in answer_lower or "contact" in answer_lower,
+            f"Unexpected answer: {response.json()['answer']}"
+        )
 
     def test_invalid_language_is_rejected(self):
         response = client.post("/api/chat", json={"message": "hello", "language": "fr-FR"})
