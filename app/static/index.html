@@ -31,11 +31,16 @@
       </div>
       <form id="businessForm">
         <label>Business name<input id="businessName" required maxlength="160" value="ABC Dental Clinic"></label>
+        <div class="two-col">
+          <label>Business category<input id="businessCategory" maxlength="120" placeholder="Healthcare, retail, hospitality…"></label>
+          <label>Profession or industry<input id="profession" maxlength="120" placeholder="Dental care, clothing, legal services…"></label>
+        </div>
         <label>About the business<textarea id="description" rows="2" maxlength="2000"></textarea></label>
         <div class="two-col">
           <label>Address<input id="address" maxlength="500"></label>
           <label>Opening hours<input id="hours" maxlength="300"></label>
         </div>
+        <label>Contact details<textarea id="contactDetails" rows="2" maxlength="500" placeholder="Phone, email, website"></textarea></label>
         <label>Services — one per line <span class="hint">Name | price | duration | description</span>
           <textarea id="services" rows="4" placeholder="Teeth cleaning | ₹1500 | 30 minutes | Cleaning and polishing"></textarea>
         </label>
@@ -45,6 +50,9 @@
         <label>FAQs — one per line <span class="hint">Question | answer</span>
           <textarea id="faqs" rows="3" placeholder="Do you accept walk-ins? | Please call before visiting."></textarea>
         </label>
+        <label>Policies<textarea id="businessPolicies" rows="2" maxlength="2000" placeholder="Returns, cancellations, walk-ins, delivery…"></textarea></label>
+        <label>Booking configuration<textarea id="bookingConfiguration" rows="2" maxlength="1000" placeholder="How customers request or confirm bookings"></textarea></label>
+        <label>Communication style<input id="communicationStyle" maxlength="300" value="natural, polite, and concise"></label>
         <label>Default language
           <select id="defaultLanguage"><option value="en-IN">English (India)</option><option value="ta-IN">Tamil (India)</option></select>
         </label>

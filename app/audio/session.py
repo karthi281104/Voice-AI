@@ -73,6 +73,12 @@ class VoiceSession:
         self.state = VoiceSessionState.LISTENING
         return was_active
 
+    def close(self) -> None:
+        """Cancel in-flight work and release audio state for a disconnected client."""
+        self.interrupt("Session closed")
+        self.history.clear()
+        self.reset_utterance()
+
     def add_audio_frame(self, pcm_bytes: bytes) -> dict[str, Any]:
         """
         Process an incoming 16 kHz mono 16-bit PCM frame.
@@ -169,4 +175,4 @@ def get_or_create_session(session_id: str, language: str = "en-IN") -> VoiceSess
 def remove_session(session_id: str) -> None:
     session = _sessions.pop(session_id, None)
     if session:
-        session.interrupt("Session closed")
+        session.close()

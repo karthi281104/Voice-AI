@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -48,36 +49,91 @@ class SileroVADDetector:
         """Attempt to load Silero VAD via ONNX runtime if available."""
         try:
             import onnxruntime as ort
-            # Optional: If a local silero_vad.onnx exists, load it
             import os
-            model_path = os.getenv("SILERO_VAD_PATH", "silero_vad.onnx")
-            if os.path.exists(model_path):
-                self._onnx_session = ort.InferenceSession(model_path)
-                logger.info("Loaded Silero VAD ONNX model from %s", model_path)
-        except Exception:
+            configured_path = os.getenv("SILERO_VAD_PATH")
+            model_path = (
+                Path(configured_path)
+                if configured_path
+                else Path(__file__).resolve().parents[2] / "silero_vad.onnx"
+            )
+            if model_path.exists():
+                opts = ort.SessionOptions()
+                opts.inter_op_num_threads = 1
+                opts.intra_op_num_threads = 1
+                self._onnx_session = ort.InferenceSession(
+                    str(model_path),
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
+                # Silero v4/v5 recurrent state tensors
+                self._h = np.zeros((2, 1, 64), dtype=np.float32)
+                self._c = np.zeros((2, 1, 64), dtype=np.float32)
+                logger.info(
+                    "Loaded Silero VAD ONNX model from %s (inputs: %s)",
+                    str(model_path),
+                    [i.name for i in self._onnx_session.get_inputs()],
+                )
+                self._using_energy_fallback = False
+            else:
+                logger.warning(
+                    "Silero VAD ONNX model not found at '%s'. "
+                    "Using energy-based VAD fallback. Set SILERO_VAD_PATH to enable neural VAD.",
+                    model_path,
+                )
+                self._using_energy_fallback = True
+        except ImportError:
+            logger.warning(
+                "onnxruntime not installed. Using energy-based VAD fallback. "
+                "Install with: pip install onnxruntime"
+            )
             self._onnx_session = None
+            self._using_energy_fallback = True
+        except Exception as exc:
+            logger.error(
+                "Silero VAD ONNX model failed to load: %s. Using energy-based fallback.",
+                exc, exc_info=True,
+            )
+            self._onnx_session = None
+            self._using_energy_fallback = True
 
     def predict_speech_prob(self, audio_chunk: np.ndarray) -> float:
         """
         Compute speech probability in [0.0, 1.0].
-        Uses ONNX Silero VAD if loaded, else robust energy/spectral feature detection.
+        Uses ONNX Silero VAD if loaded (with correct v4/v5 input tensors),
+        else uses robust energy/spectral feature detection.
         """
         if audio_chunk.size == 0:
             return 0.0
 
         if self._onnx_session is not None:
             try:
-                # Silero VAD v4/v5 ONNX expects 512 samples at 16kHz
-                padded = audio_chunk
-                if len(padded) != 512:
-                    padded = np.pad(padded, (0, max(0, 512 - len(padded))))[:512]
-                tensor_in = padded.reshape(1, -1).astype(np.float32)
-                outputs = self._onnx_session.run(None, {"input": tensor_in})
-                return float(outputs[0][0][0])
-            except Exception:
-                pass
+                # Silero VAD v4/v5: expects 512 samples at 16kHz
+                chunk = audio_chunk
+                if len(chunk) != 512:
+                    chunk = np.pad(chunk, (0, max(0, 512 - len(chunk))))[:512]
+                tensor_in = chunk.reshape(1, -1).astype(np.float32)
+                sr_tensor = np.array(self.sample_rate, dtype=np.int64)
 
-        # Adaptive energy and spectral dynamics fallback
+                # Try v4/v5 signature: input, sr, h, c -> output, hn, cn
+                ort_inputs = {
+                    "input": tensor_in,
+                    "sr": sr_tensor,
+                    "h": self._h,
+                    "c": self._c,
+                }
+                outputs = self._onnx_session.run(None, ort_inputs)
+                prob = float(outputs[0].squeeze())
+                # Update recurrent state
+                self._h = outputs[1]
+                self._c = outputs[2]
+                return float(np.clip(prob, 0.0, 1.0))
+            except Exception as exc:
+                logger.debug(
+                    "Silero ONNX inference failed (%s), using energy fallback", exc
+                )
+                # Fall through to energy fallback
+
+        # Energy-based fallback
         rms = calculate_rms_energy(audio_chunk)
         if rms < self._noise_floor * 0.9:
             self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
