@@ -31,6 +31,8 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int = 16000) -> n
     """
     Fast linear interpolation resampler from orig_sr to target_sr.
     """
+    if orig_sr <= 0 or target_sr <= 0:
+        raise ValueError("Sample rates must be positive integers")
     if orig_sr == target_sr or audio.size == 0:
         return audio
     num_target_samples = int(round(len(audio) * target_sr / orig_sr))

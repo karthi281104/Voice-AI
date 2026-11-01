@@ -102,17 +102,36 @@ def transcribe(
         err_str = str(r_err).lower()
         if "cublas" in err_str or "cuda" in err_str:
             logger.warning("CUDA execution failed (%s), falling back to CPU/int8", r_err)
-            from faster_whisper import WhisperModel
-            _model_instance = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-            segments, info = _model_instance.transcribe(
-                audio,
-                beam_size=1,
-                language=lang_code,
-                vad_filter=False,
-            )
-            text = " ".join(segment.text.strip() for segment in segments).strip()
+            try:
+                from faster_whisper import WhisperModel
+                _model_instance = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+                segments, info = _model_instance.transcribe(
+                    audio,
+                    beam_size=1,
+                    language=lang_code,
+                    vad_filter=False,
+                )
+                text = " ".join(segment.text.strip() for segment in segments).strip()
+            except Exception as fallback_exc:
+                logger.error("CPU/int8 STT fallback failed: %s", fallback_exc, exc_info=True)
+                if raise_on_error:
+                    raise STTUnavailableError("Speech recognition failed on CUDA and CPU fallbacks") from fallback_exc
+                return {
+                    "text": "",
+                    "language": language or "en",
+                    "language_probability": 0.0,
+                    "error": "stt_unavailable",
+                }
         else:
-            raise
+            if raise_on_error:
+                raise STTUnavailableError("Speech recognition failed") from r_err
+            logger.error("Speech recognition failed: %s", r_err, exc_info=True)
+            return {
+                "text": "",
+                "language": language or "en",
+                "language_probability": 0.0,
+                "error": "stt_error",
+            }
 
     return {
         "text": text,
@@ -120,4 +139,3 @@ def transcribe(
         "language_probability": getattr(info, "language_probability", 1.0),
         "error": None,
     }
-

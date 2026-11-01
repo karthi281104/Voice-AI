@@ -108,6 +108,75 @@ class FallbackScenariosTests(unittest.TestCase):
             self.assertIsNone(data["fallback_reason"])
             mock_llm.assert_not_called()
 
+    def test_fast_path_plain_time_question_uses_business_hours(self):
+        with patch("app.main.answer_question_llm") as mock_llm:
+            res = client.post("/api/chat", json={"message": "what is the time?", "language": "en-IN"})
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertEqual(data["engine"], "rule_based")
+            self.assertEqual(data["source"], "business")
+            self.assertIn("9 AM-6 PM", data["answer"])
+            mock_llm.assert_not_called()
+
+    def test_fast_path_generic_doctor_visit_question_uses_schedule(self):
+        with patch("app.main.answer_question_llm") as mock_llm:
+            res = client.post("/api/chat", json={
+                "message": "when can I visit the doctor?",
+                "language": "en-IN",
+            })
+            self.assertEqual(res.status_code, 200)
+            data = res.json()
+            self.assertEqual(data["engine"], "rule_based")
+            self.assertEqual(data["source"], "doctor")
+            self.assertIn("10 AM-4 PM", data["answer"])
+            mock_llm.assert_not_called()
+
+    def test_clinic_information_uses_saved_profile(self):
+        response = client.post("/api/chat", json={"message": "Tell me about the clinic"})
+        self.assertEqual(response.status_code, 200)
+        answer = response.json()["answer"]
+        self.assertIn("Karthi Dental Clinic", answer)
+        self.assertIn("Teeth Scaling", answer)
+        self.assertIn("Chennai", answer)
+
+    def test_generic_prices_list_all_services(self):
+        response = client.post("/api/chat", json={"message": "Can I know the prices?"})
+        self.assertEqual(response.status_code, 200)
+        answer = response.json()["answer"]
+        self.assertIn("Teeth Scaling", answer)
+        self.assertIn("₹1000", answer)
+        self.assertIn("Root Canal", answer)
+        self.assertIn("₹4500", answer)
+
+    def test_unknown_service_price_does_not_invent_amount(self):
+        response = client.post("/api/chat", json={"message": "How much does implant surgery cost?"})
+        self.assertEqual(response.status_code, 200)
+        answer = response.json()["answer"].lower()
+        self.assertIn("do not have", answer)
+        self.assertNotIn("₹1000", answer)
+
+    def test_appointment_request_asks_for_date_and_time(self):
+        response = client.post("/api/chat", json={"message": "I want to book an appointment."})
+        self.assertEqual(response.status_code, 200)
+        answer = response.json()["answer"].lower()
+        self.assertIn("date", answer)
+        self.assertIn("time", answer)
+        self.assertIn("confirmed", answer)
+
+    def test_appointment_requirement_is_not_overpromised(self):
+        response = client.post("/api/chat", json={"message": "Is there any appointment needed?"})
+        self.assertEqual(response.status_code, 200)
+        answer = response.json()["answer"].lower()
+        self.assertIn("contact", answer)
+        self.assertNotIn("appointment booked", answer)
+
+    def test_tomorrow_hours_include_day_context(self):
+        response = client.post("/api/chat", json={"message": "Are you open tomorrow?"})
+        self.assertEqual(response.status_code, 200)
+        answer = response.json()["answer"]
+        self.assertIn("Monday-Saturday", answer)
+        self.assertIn("Tomorrow is", answer)
+
     def test_complex_query_uses_llm_when_available(self):
         """Complex conversational query routes to LLM and returns engine='llm'."""
         with patch("app.main.chat_completion", new_callable=AsyncMock) as mock_complete:

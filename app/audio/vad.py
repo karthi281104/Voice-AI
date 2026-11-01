@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -49,13 +50,18 @@ class SileroVADDetector:
         try:
             import onnxruntime as ort
             import os
-            model_path = os.getenv("SILERO_VAD_PATH", "silero_vad.onnx")
-            if os.path.exists(model_path):
+            configured_path = os.getenv("SILERO_VAD_PATH")
+            model_path = (
+                Path(configured_path)
+                if configured_path
+                else Path(__file__).resolve().parents[2] / "silero_vad.onnx"
+            )
+            if model_path.exists():
                 opts = ort.SessionOptions()
                 opts.inter_op_num_threads = 1
                 opts.intra_op_num_threads = 1
                 self._onnx_session = ort.InferenceSession(
-                    model_path,
+                    str(model_path),
                     sess_options=opts,
                     providers=["CPUExecutionProvider"],
                 )
@@ -64,7 +70,7 @@ class SileroVADDetector:
                 self._c = np.zeros((2, 1, 64), dtype=np.float32)
                 logger.info(
                     "Loaded Silero VAD ONNX model from %s (inputs: %s)",
-                    model_path,
+                    str(model_path),
                     [i.name for i in self._onnx_session.get_inputs()],
                 )
                 self._using_energy_fallback = False

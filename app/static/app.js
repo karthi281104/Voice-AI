@@ -43,9 +43,15 @@ function linesFromItems(items, type) {
 function fillForm(b) {
   currentBusiness = b;
   $("businessName").value = b.name || "";
+  $("businessCategory").value = b.business_category || "";
+  $("profession").value = b.profession || "";
   $("description").value = b.description || "";
   $("address").value = b.address || "";
+  $("contactDetails").value = b.contact_details || "";
   $("hours").value = b.hours || "";
+  $("businessPolicies").value = b.business_policies || "";
+  $("bookingConfiguration").value = b.booking_configuration || "";
+  $("communicationStyle").value = b.communication_style || "natural, polite, and concise";
   $("defaultLanguage").value = b.default_language || "en-IN";
   $("services").value = linesFromItems(b.services || [], "service");
   $("doctors").value = linesFromItems(b.doctors || [], "doctor");
@@ -92,9 +98,15 @@ $("businessForm").addEventListener("submit", async (event) => {
   try {
     const payload = {
       name: $("businessName").value.trim(),
+      business_category: $("businessCategory").value.trim(),
+      profession: $("profession").value.trim(),
       description: $("description").value.trim(),
       address: $("address").value.trim(),
+      contact_details: $("contactDetails").value.trim(),
       hours: $("hours").value.trim(),
+      business_policies: $("businessPolicies").value.trim(),
+      booking_configuration: $("bookingConfiguration").value.trim(),
+      communication_style: $("communicationStyle").value.trim(),
       default_language: $("defaultLanguage").value,
       services: parseLines($("services").value, "service"),
       doctors: parseLines($("doctors").value, "doctor"),
@@ -140,6 +152,7 @@ function getVoiceScore(voice, targetLang) {
 function populateVoices() {
   if (!("speechSynthesis" in window)) return;
   availableVoices = window.speechSynthesis.getVoices();
+  selectedVoice = null;
   const targetLang = $("chatLanguage").value;
   const isTamil = targetLang.startsWith("ta");
   const select = $("voiceSelect");
@@ -733,4 +746,3 @@ if ("speechSynthesis" in window) {
     $("saveStatus").textContent = error.message;
   }
 })();
-
