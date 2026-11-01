@@ -6,6 +6,7 @@ import os
 import re
 import time
 from collections.abc import AsyncGenerator
+from enum import Enum
 from typing import Any
 
 import httpx
@@ -18,6 +19,17 @@ OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "45"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
 
 client: httpx.AsyncClient | None = None
+
+
+class LLMFailureReason(str, Enum):
+    """Structured classification of why the LLM path failed or was bypassed."""
+    SUCCESS = "success"
+    UNAVAILABLE = "ollama_unavailable"       # Connection refused / network error
+    TIMEOUT = "ollama_timeout"               # Read/connect timeout
+    MODEL_NOT_FOUND = "model_not_found"      # HTTP 404 or model not in /api/tags
+    BAD_RESPONSE = "bad_response"            # Non-200 HTTP, malformed JSON
+    FILTER_REJECTED = "filter_rejected"      # LLM responded but reasoning-filter wiped it
+    EMPTY_ANSWER = "empty_answer"            # LLM returned empty content string
 
 
 async def start_ollama_client() -> httpx.AsyncClient:
@@ -36,9 +48,14 @@ async def start_ollama_client() -> httpx.AsyncClient:
 async def stop_ollama_client() -> None:
     """Gracefully close the persistent AsyncClient."""
     global client
-    if client is not None and not client.is_closed:
-        await client.aclose()
-        client = None
+    if client is not None:
+        try:
+            if not client.is_closed:
+                await client.aclose()
+        except Exception:
+            pass
+        finally:
+            client = None
         logger.info("Closed persistent Ollama AsyncClient")
 
 
@@ -75,27 +92,56 @@ async def check_ollama_status() -> dict[str, Any]:
                 "model_available": model_found,
                 "available_models": models,
             }
+        else:
+            logger.warning("Ollama /api/tags returned HTTP %s", response.status_code)
+    except httpx.ConnectError as exc:
+        logger.warning("Ollama unreachable at %s: %s", OLLAMA_BASE_URL, exc)
+        return {
+            "connected": False,
+            "base_url": OLLAMA_BASE_URL,
+            "configured_model": OLLAMA_MODEL,
+            "model_available": False,
+            "error": f"Connection refused: {exc}",
+            "failure_reason": LLMFailureReason.UNAVAILABLE,
+        }
+    except httpx.TimeoutException as exc:
+        logger.warning("Ollama status check timed out: %s", exc)
+        return {
+            "connected": False,
+            "base_url": OLLAMA_BASE_URL,
+            "configured_model": OLLAMA_MODEL,
+            "model_available": False,
+            "error": f"Timeout: {exc}",
+            "failure_reason": LLMFailureReason.TIMEOUT,
+        }
     except Exception as exc:
+        logger.warning("Ollama status check failed: %s", exc)
         return {
             "connected": False,
             "base_url": OLLAMA_BASE_URL,
             "configured_model": OLLAMA_MODEL,
             "model_available": False,
             "error": str(exc),
+            "failure_reason": LLMFailureReason.BAD_RESPONSE,
         }
     return {
         "connected": False,
         "base_url": OLLAMA_BASE_URL,
         "configured_model": OLLAMA_MODEL,
         "model_available": False,
+        "failure_reason": LLMFailureReason.BAD_RESPONSE,
     }
 
 
 def is_reasoning_text(text: str) -> bool:
-    """Check if the text contains leaked internal reasoning or meta-instructions."""
+    """
+    Check if the text contains leaked internal reasoning or meta-instructions.
+    Only flags true internal reasoning/meta-commentary - NOT valid receptionist responses.
+    """
     if not text:
         return True
     low = text.lower().strip()
+
     if low.startswith((
         "- keep", "- respond", "- the business", "- the doctors", "- doctors",
         "- services", "- hours", "- address", "- phone", "- clinic", "- faqs",
@@ -113,11 +159,14 @@ def is_reasoning_text(text: str) -> bool:
         "background:",
     )):
         return True
+
     indicators = (
         "we are given", "let me check", "let me think", "let me interpret", "let me make sure",
         "the user asks", "the user said", "the user is asking", "the user just said",
         "the user asked", "okay, let me", "okay, the user",
-        "step 1", "step 2", "steps:", "should be:", "rules:", "guidelines",
+        "the caller asks", "the caller said", "the caller is asking", "the caller just said",
+        "the caller asked", "caller is asking",
+        "step 1", "step 2", "steps:", "should be:", "rules:",
         "concise (1-3 sentences)", "i need to", "possible response",
         "translates to", "first, i need", "without a greeting", "double-checking",
         "we must respond", "we have to", "the answer:",
@@ -137,7 +186,7 @@ def is_reasoning_text(text: str) -> bool:
         "written as one string", "let's craft", "let's stick", "stick to that format",
         "we don't have any other", "however, the user", "but the user", "the answer should list",
         "so, the answer should", "so the answer should",
-        "the response needs to be", "the response should be", "i'll state", "i will state",
+        "the response needs to be", "the response should be",
         "the user might be", "the user may be", "so i'll make", "so i will make",
         "i'll make it clear", "i will make it clear", "without any internal reasoning",
         "- doctors", "- services",
@@ -149,48 +198,44 @@ def is_reasoning_text(text: str) -> bool:
     return any(ind in low for ind in indicators)
 
 
-
-
 def clean_conversational_response(raw_text: str) -> str:
     """
-    Robust cleaner that guarantees NO internal reasoning, planning, or model metadata leaks.
-    Strips <think> tags, chain-of-thought preambles, and meta-commentary, leaving only
-    the user-facing receptionist response. If the text consists solely of leaked reasoning
-    without a clean answer, returns empty string to allow graceful fallback.
+    Robust cleaner that strips <think> tags, chain-of-thought preambles, and meta-commentary,
+    leaving only the user-facing receptionist response. Returns empty string if only reasoning found.
     """
     if not raw_text:
         return ""
     text = raw_text.strip()
 
-    # 1. If </think> is present, extract text after the think block
+    # 1. If </think> present, extract text after the think block
     if "</think>" in text:
         after_think = text.rsplit("</think>", 1)[-1].strip()
         if after_think and not is_reasoning_text(after_think):
-            return re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', after_think, flags=re.IGNORECASE).strip('"\' ')
+            return re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', after_think, flags=re.IGNORECASE).strip('"\'  ')
 
-    # 2. Check for explicit quoted response after transition phrase
-    match = re.search(
-        r'(?:therefore,?\s*(?:the\s*)?response\s*(?:is)?:?|response:?|receptionist:?|possible response:?)\s*["“]([^"”\n\r]{5,})["”]',
+    # 2. Check for explicit quoted response after transition phrase (inspect from latest to earliest)
+    matches = list(re.finditer(
+        r'(?:so\s+(?:my|the)\s+response\s+(?:should\s+be|is):?|therefore,?\s*(?:the\s*)?response\s*(?:is)?:?|response:?|receptionist:?|possible response:?)\s*["\u201c]([^"\u201d\n\r]{5,})["\u201d]',
         text,
         re.I
-    )
-    if match:
-        cand = match.group(1).strip()
+    ))
+    for m in reversed(matches):
+        cand = m.group(1).strip()
         if not is_reasoning_text(cand):
-            return re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', cand, flags=re.IGNORECASE).strip('"\' ')
+            return re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', cand, flags=re.IGNORECASE).strip('"\'  ')
 
-    # 3. Check if text without think tags is clean of reasoning
+    # 3. Check if text without think tags is clean
     text_no_tags = re.sub(r"</?think>", "", text).strip()
     if not is_reasoning_text(text_no_tags):
-        clean = re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', text_no_tags, flags=re.IGNORECASE).strip('"\' ')
+        clean = re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', text_no_tags, flags=re.IGNORECASE).strip('"\'  ')
         if clean:
             return clean
 
-    # 4. Filter reasoning lines and extract clean concluding line if available
+    # 4. Filter reasoning lines and extract clean concluding lines
     lines = [l.strip() for l in text_no_tags.splitlines() if l.strip()]
     candidate_lines = []
     for l in lines:
-        cleaned_line = re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', l, flags=re.IGNORECASE).strip('"\' ')
+        cleaned_line = re.sub(r'^(?:Assistant|Receptionist|Response|Answer|Possible response|Final answer|Greeting):\s*', '', l, flags=re.IGNORECASE).strip('"\'  ')
         if not is_reasoning_text(cleaned_line) and not re.match(r"^\d+\.\s+", cleaned_line) and len(cleaned_line) > 4:
             candidate_lines.append(cleaned_line)
 
@@ -199,7 +244,6 @@ def clean_conversational_response(raw_text: str) -> str:
         if not is_reasoning_text(clean):
             return clean
 
-    # 5. Model output is unresolvable reasoning; return empty string for safe fallback
     return ""
 
 
@@ -208,23 +252,21 @@ def clean_reasoning_tokens(raw_text: str) -> str:
     return clean_conversational_response(raw_text)
 
 
-
 async def stream_chat_completion(
     messages: list[dict[str, str]],
     model: str | None = None,
     options: dict[str, Any] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
-    Stream tokens directly from Ollama /api/chat using persistent HTTP client.
-    Guarantees non-thinking output with think: False at request root and in options.
-    Filters out any internal reasoning tokens or <think> tags before yielding to client.
+    Stream tokens from Ollama /api/chat using persistent HTTP client.
+    Yields token events then a done event with failure_reason field.
     """
     http_client = get_ollama_client()
     target_model = model or OLLAMA_MODEL
 
     default_options = {
         "temperature": 0.1,
-        "num_predict": 250,
+        "num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", "600")),
         "think": False,
     }
     if options:
@@ -234,7 +276,7 @@ async def stream_chat_completion(
         "model": target_model,
         "messages": messages,
         "stream": True,
-        "think": False,  # Ollama top-level parameter to disable thinking
+        "think": False,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": default_options,
     }
@@ -244,141 +286,162 @@ async def stream_chat_completion(
     accumulated_user_tokens: list[str] = []
     in_think_block = False
     detected_mode = False
-
     reasoning_buffer = ""
     stream_started = False
 
-    async with http_client.stream("POST", "/api/chat", json=payload) as response:
-        if response.status_code != 200:
-            raise httpx.HTTPStatusError(
-                f"Ollama returned status {response.status_code}",
-                request=response.request,
-                response=response,
-            )
+    try:
+        async with http_client.stream("POST", "/api/chat", json=payload) as response:
+            if response.status_code == 404:
+                logger.error("Ollama model not found: %s (HTTP 404)", target_model)
+                yield {"type": "done", "answer": "", "engine": "llm", "source": "llm",
+                       "model": target_model,
+                       "response_time_ms": round((time.perf_counter() - t_start) * 1000, 1),
+                       "ttft_ms": 0.0, "failure_reason": LLMFailureReason.MODEL_NOT_FOUND}
+                return
+            if response.status_code != 200:
+                logger.error("Ollama HTTP %s for model %s", response.status_code, target_model)
+                yield {"type": "done", "answer": "", "engine": "llm", "source": "llm",
+                       "model": target_model,
+                       "response_time_ms": round((time.perf_counter() - t_start) * 1000, 1),
+                       "ttft_ms": 0.0, "failure_reason": LLMFailureReason.BAD_RESPONSE}
+                return
 
-        async for line in response.aiter_lines():
-            if not line:
-                continue
-            try:
-                chunk = json.loads(line)
-            except Exception:
-                continue
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    logger.warning("Malformed JSON from Ollama stream: %s", exc)
+                    continue
 
-            msg = chunk.get("message", {})
-            # STRICT: NEVER yield or process msg.get("thinking")
-            content = msg.get("content", "")
-            if not content:
-                if chunk.get("done", False):
-                    break
-                continue
+                msg = chunk.get("message", {})
+                content = msg.get("content", "")
+                thinking_piece = msg.get("thinking", "")
+                if thinking_piece:
+                    reasoning_buffer += thinking_piece
 
-            # 1. Filter out XML think tags: <think> ... </think>
-            if "<think>" in content:
-                in_think_block = True
-                detected_mode = True
-                content = content.split("<think>", 1)[-1]
+                if not content:
+                    if chunk.get("done", False):
+                        break
+                    continue
 
-            if "</think>" in content:
-                in_think_block = False
-                detected_mode = True
-                # Everything buffered before </think> is internal reasoning -> DISCARD IT!
-                reasoning_buffer = ""
-                content = content.split("</think>", 1)[-1]
-                stream_started = True
-
-            # Detect whether initial generation is thinking deliberation or direct response
-            if not detected_mode and content.strip():
-                low = content.lower().strip()
-                if is_reasoning_text(low) or any(low.startswith(p) for p in ("we are", "the user", "the caller", "let me", "okay,", "first,", "as the", "i need", "looking at", "so the")):
+                if "<think>" in content:
                     in_think_block = True
                     detected_mode = True
-                elif len(low) >= 3:
+                    content = content.split("<think>", 1)[-1]
+
+                if "</think>" in content:
                     in_think_block = False
                     detected_mode = True
-
-            if in_think_block:
-                continue
-
-            clean_piece = re.sub(r"</?think>", "", content)
-            if not clean_piece:
-                continue
-
-            # 2. Check for reasoning preambles if thinking tags were not used
-            if not stream_started:
-                reasoning_buffer += clean_piece
-                buf_low = reasoning_buffer.lower().strip()
-                starts_reasoning = is_reasoning_text(buf_low) or any(
-                    buf_low.startswith(p)
-                    for p in (
-                        "we are given", "we are the receptionist", "the user said", "the user asks",
-                        "let me check", "i need to", "possible response",
-                        "first, i need", "steps:", "okay, the user"
-                    )
-                )
-                if starts_reasoning:
-                    resp_match = re.search(
-                        r'(?:therefore,?\s*(?:the\s*)?response\s*(?:is)?:?|response:?|receptionist:?|possible response:?)\s*["“]?([^"”\n\r]+)',
-                        reasoning_buffer,
-                        re.I
-                    )
-                    if resp_match:
-                        clean_text = resp_match.group(1).strip()
-                        if clean_text and not is_reasoning_text(clean_text):
-                            stream_started = True
-                            if t_first_token is None:
-                                t_first_token = time.perf_counter()
-                            accumulated_user_tokens.append(clean_text)
-                            yield {
-                                "type": "token",
-                                "content": clean_text,
-                                "is_first": True,
-                                "ttft_ms": round((t_first_token - t_start) * 1000, 1),
-                            }
-                    elif len(reasoning_buffer) > 80:
-                        # Buffer grew large with no extractable pattern — model is answering
-                        # directly. Commit it rather than silently discarding everything.
-                        cleaned = clean_conversational_response(reasoning_buffer)
-                        if cleaned:
-                            stream_started = True
-                            reasoning_buffer = ""
-                            if t_first_token is None:
-                                t_first_token = time.perf_counter()
-                            accumulated_user_tokens.append(cleaned)
-                            yield {
-                                "type": "token",
-                                "content": cleaned,
-                                "is_first": True,
-                                "ttft_ms": round((t_first_token - t_start) * 1000, 1),
-                            }
-                    continue
-                else:
-                    # Clean user response starting directly without reasoning!
-                    stream_started = True
-                    clean_piece = reasoning_buffer
                     reasoning_buffer = ""
+                    content = content.split("</think>", 1)[-1]
+                    stream_started = True
 
-            # Stream user-facing token
-            if clean_piece:
-                # Strip leading newlines on first emitted token
-                if not accumulated_user_tokens:
-                    clean_piece = clean_piece.lstrip("\n\r")
+                if not detected_mode and content.strip():
+                    low = content.lower().strip()
+                    if is_reasoning_text(low) or any(low.startswith(p) for p in (
+                        "we are", "the user", "let me", "okay,", "first,", "as the", "i need",
+                        "looking at", "so the",
+                    )):
+                        in_think_block = True
+                        detected_mode = True
+                    elif len(low) >= 3:
+                        in_think_block = False
+                        detected_mode = True
+
+                if in_think_block:
+                    continue
+
+                clean_piece = re.sub(r"</?think>", "", content)
+                if not clean_piece:
+                    continue
+
+                if not stream_started:
+                    reasoning_buffer += clean_piece
+                    buf_low = reasoning_buffer.lower().strip()
+                    starts_reasoning = is_reasoning_text(buf_low) or any(
+                        buf_low.startswith(p)
+                        for p in (
+                            "we are given", "we are the receptionist", "the user said",
+                            "the user asks", "let me check", "i need to", "possible response",
+                            "first, i need", "steps:", "okay, the user",
+                        )
+                    )
+                    if starts_reasoning:
+                        resp_match = re.search(
+                            r'(?:therefore,?\s*(?:the\s*)?response\s*(?:is)?:?|response:?|'
+                            r'receptionist:?|possible response:?)\s*["\u201c]?([^"\u201d\n\r]+)',
+                            reasoning_buffer, re.I
+                        )
+                        if resp_match:
+                            clean_text = resp_match.group(1).strip()
+                            if clean_text and not is_reasoning_text(clean_text):
+                                stream_started = True
+                                if t_first_token is None:
+                                    t_first_token = time.perf_counter()
+                                accumulated_user_tokens.append(clean_text)
+                                yield {"type": "token", "content": clean_text, "is_first": True,
+                                       "ttft_ms": round((t_first_token - t_start) * 1000, 1)}
+                        elif len(reasoning_buffer) > 80:
+                            cleaned = clean_conversational_response(reasoning_buffer)
+                            if cleaned:
+                                stream_started = True
+                                reasoning_buffer = ""
+                                if t_first_token is None:
+                                    t_first_token = time.perf_counter()
+                                accumulated_user_tokens.append(cleaned)
+                                yield {"type": "token", "content": cleaned, "is_first": True,
+                                       "ttft_ms": round((t_first_token - t_start) * 1000, 1)}
+                            else:
+                                logger.debug(
+                                    "Buffer >80 chars is pure reasoning, no extractable answer: %.80s",
+                                    reasoning_buffer
+                                )
+                        continue
+                    else:
+                        stream_started = True
+                        clean_piece = reasoning_buffer
+                        reasoning_buffer = ""
+
                 if clean_piece:
-                    accumulated_user_tokens.append(clean_piece)
-                    now = time.perf_counter()
-                    is_first = False
-                    if t_first_token is None:
-                        t_first_token = now
-                        is_first = True
+                    if not accumulated_user_tokens:
+                        clean_piece = clean_piece.lstrip("\n\r")
+                    if clean_piece:
+                        accumulated_user_tokens.append(clean_piece)
+                        now = time.perf_counter()
+                        is_first = t_first_token is None
+                        if is_first:
+                            t_first_token = now
+                        yield {
+                            "type": "token", "content": clean_piece, "is_first": is_first,
+                            "ttft_ms": round((t_first_token - t_start) * 1000, 1) if is_first else None,
+                        }
 
-                    yield {
-                        "type": "token",
-                        "content": clean_piece,
-                        "is_first": is_first,
-                        "ttft_ms": round((t_first_token - t_start) * 1000, 1) if is_first else None,
-                    }
+                if chunk.get("done", False):
+                    break
 
-            if chunk.get("done", False):
-                break
+    except httpx.ConnectError as exc:
+        logger.error("Ollama connection refused (%s): %s", OLLAMA_BASE_URL, exc)
+        yield {"type": "done", "answer": "", "engine": "llm", "source": "llm",
+               "model": target_model,
+               "response_time_ms": round((time.perf_counter() - t_start) * 1000, 1),
+               "ttft_ms": 0.0, "failure_reason": LLMFailureReason.UNAVAILABLE}
+        return
+    except httpx.ReadTimeout as exc:
+        logger.error("Ollama streaming read timeout after %.1fs: %s", OLLAMA_TIMEOUT_SECONDS, exc)
+        yield {"type": "done", "answer": "", "engine": "llm", "source": "llm",
+               "model": target_model,
+               "response_time_ms": round((time.perf_counter() - t_start) * 1000, 1),
+               "ttft_ms": 0.0, "failure_reason": LLMFailureReason.TIMEOUT}
+        return
+    except httpx.TimeoutException as exc:
+        logger.error("Ollama streaming timeout: %s", exc)
+        yield {"type": "done", "answer": "", "engine": "llm", "source": "llm",
+               "model": target_model,
+               "response_time_ms": round((time.perf_counter() - t_start) * 1000, 1),
+               "ttft_ms": 0.0, "failure_reason": LLMFailureReason.TIMEOUT}
+        return
 
     t_end = time.perf_counter()
     duration_ms = round((t_end - t_start) * 1000, 1)
@@ -388,12 +451,19 @@ async def stream_chat_completion(
     if not full_text and reasoning_buffer:
         full_text = clean_conversational_response(reasoning_buffer)
         if full_text:
-            yield {
-                "type": "token",
-                "content": full_text,
-                "is_first": True,
-                "ttft_ms": duration_ms,
-            }
+            yield {"type": "token", "content": full_text, "is_first": True, "ttft_ms": duration_ms}
+
+    failure_reason: LLMFailureReason | None = None
+    if not full_text:
+        if accumulated_user_tokens:
+            failure_reason = LLMFailureReason.FILTER_REJECTED
+            logger.warning(
+                "Ollama response filtered (reasoning leakage) model=%s raw=%.120s",
+                target_model, "".join(accumulated_user_tokens)[:120]
+            )
+        else:
+            failure_reason = LLMFailureReason.EMPTY_ANSWER
+            logger.warning("Ollama returned empty content for model %s", target_model)
 
     yield {
         "type": "done",
@@ -403,6 +473,7 @@ async def stream_chat_completion(
         "model": target_model,
         "response_time_ms": duration_ms,
         "ttft_ms": ttft_ms,
+        "failure_reason": failure_reason,
     }
 
 
@@ -410,14 +481,17 @@ async def chat_completion(
     messages: list[dict[str, str]],
     model: str | None = None,
     options: dict[str, Any] | None = None,
-) -> tuple[str, float] | None:
-    """Non-streaming chat completion using persistent AsyncClient with think: False."""
+) -> tuple[str, float, LLMFailureReason | None] | tuple[None, float, LLMFailureReason]:
+    """
+    Non-streaming chat completion via persistent AsyncClient.
+    Returns (answer, duration_ms, SUCCESS) on success or (None, duration_ms, reason) on failure.
+    """
     http_client = get_ollama_client()
     target_model = model or OLLAMA_MODEL
 
     default_options = {
         "temperature": 0.1,
-        "num_predict": 250,
+        "num_predict": int(os.getenv("OLLAMA_NUM_PREDICT", "600")),
         "think": False,
     }
     if options:
@@ -427,7 +501,7 @@ async def chat_completion(
         "model": target_model,
         "messages": messages,
         "stream": False,
-        "think": False,  # Ollama top-level parameter to disable thinking
+        "think": False,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": default_options,
     }
@@ -435,23 +509,53 @@ async def chat_completion(
     t_start = time.perf_counter()
     try:
         response = await http_client.post("/api/chat", json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
-        if response.status_code == 200:
-            data = response.json()
-            msg = data.get("message", {})
-            raw_content = str(msg.get("content", "")).strip()
-            # NEVER fall back to msg.get("thinking")
-            answer = clean_conversational_response(raw_content)
-            duration_ms = round((time.perf_counter() - t_start) * 1000, 1)
-            if answer:
-                leak_check = re.search(
-                    r"^(step \d|we are given|the user asks|let me check|i need to respond|possible response)",
-                    answer,
-                    flags=re.IGNORECASE
-                )
-                if not leak_check:
-                    return answer, duration_ms
-    except Exception as exc:
-        logger.debug("Ollama chat_completion failed: %s", exc)
-        return None
-    return None
+        duration_ms = round((time.perf_counter() - t_start) * 1000, 1)
 
+        if response.status_code == 404:
+            logger.error("Ollama model not found: %s (HTTP 404)", target_model)
+            return None, duration_ms, LLMFailureReason.MODEL_NOT_FOUND
+
+        if response.status_code != 200:
+            logger.error("Ollama HTTP %s for model %s", response.status_code, target_model)
+            return None, duration_ms, LLMFailureReason.BAD_RESPONSE
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            logger.error("Malformed JSON from Ollama: %s", exc)
+            return None, duration_ms, LLMFailureReason.BAD_RESPONSE
+
+        msg = data.get("message", {})
+        raw_content = str(msg.get("content", "")).strip()
+        if not raw_content:
+            thinking = str(msg.get("thinking", "")).strip()
+            if thinking:
+                extracted = clean_conversational_response(thinking)
+                if extracted:
+                    raw_content = extracted
+        if not raw_content:
+            logger.warning("Ollama returned empty content for model %s", target_model)
+            return None, duration_ms, LLMFailureReason.EMPTY_ANSWER
+
+        answer = clean_conversational_response(raw_content)
+        if not answer:
+            logger.warning(
+                "Ollama response filtered (reasoning leakage) model=%s raw=%.120s",
+                target_model, raw_content[:120]
+            )
+            return None, duration_ms, LLMFailureReason.FILTER_REJECTED
+
+        return answer, duration_ms, LLMFailureReason.SUCCESS
+
+    except httpx.ConnectError as exc:
+        duration_ms = round((time.perf_counter() - t_start) * 1000, 1)
+        logger.error("Ollama connection refused (%s): %s", OLLAMA_BASE_URL, exc)
+        return None, duration_ms, LLMFailureReason.UNAVAILABLE
+    except httpx.TimeoutException as exc:
+        duration_ms = round((time.perf_counter() - t_start) * 1000, 1)
+        logger.error("Ollama timed out after %.1fs: %s", OLLAMA_TIMEOUT_SECONDS, exc)
+        return None, duration_ms, LLMFailureReason.TIMEOUT
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - t_start) * 1000, 1)
+        logger.error("Unexpected Ollama error: %s", exc, exc_info=True)
+        return None, duration_ms, LLMFailureReason.BAD_RESPONSE
