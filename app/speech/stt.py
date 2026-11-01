@@ -9,8 +9,8 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 MODEL_SIZE = os.getenv("STT_MODEL", "small")
-DEVICE = os.getenv("STT_DEVICE", "cuda")
-COMPUTE_TYPE = os.getenv("STT_COMPUTE_TYPE", "float16")
+DEVICE = os.getenv("STT_DEVICE", "cpu")
+COMPUTE_TYPE = os.getenv("STT_COMPUTE_TYPE", "int8")
 
 _model_instance = None
 _model_load_failed = False
@@ -20,10 +20,13 @@ class STTUnavailableError(RuntimeError):
     """Raised when the STT model is not installed or failed to load."""
 
 
-def get_stt_model():
+def get_stt_model(force_reload: bool = False):
     """Lazy initialize and cache the faster-whisper model instance."""
     global _model_instance, _model_load_failed
-    if _model_load_failed:
+    if force_reload:
+        _model_instance = None
+        _model_load_failed = False
+    if _model_load_failed and not force_reload:
         return None
     if _model_instance is None:
         try:
@@ -74,6 +77,7 @@ def transcribe(
             "error": str | None
         }
     """
+    global _model_instance
     model = get_stt_model()
     if model is None:
         if raise_on_error:
@@ -86,16 +90,33 @@ def transcribe(
         }
 
     lang_code = language.split("-")[0] if language else None
-    segments, info = model.transcribe(
-        audio,
-        beam_size=1,
-        language=lang_code,
-        vad_filter=False,
-    )
-    text = " ".join(segment.text.strip() for segment in segments).strip()
+    try:
+        segments, info = model.transcribe(
+            audio,
+            beam_size=1,
+            language=lang_code,
+            vad_filter=False,
+        )
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+    except RuntimeError as r_err:
+        err_str = str(r_err).lower()
+        if "cublas" in err_str or "cuda" in err_str:
+            logger.warning("CUDA execution failed (%s), falling back to CPU/int8", r_err)
+            from faster_whisper import WhisperModel
+            _model_instance = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+            segments, info = _model_instance.transcribe(
+                audio,
+                beam_size=1,
+                language=lang_code,
+                vad_filter=False,
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
+        else:
+            raise
+
     return {
         "text": text,
-        "language": info.language,
+        "language": getattr(info, "language", language or "en"),
         "language_probability": getattr(info, "language_probability", 1.0),
         "error": None,
     }
