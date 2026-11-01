@@ -516,99 +516,215 @@ $("clearChat").addEventListener("click", () => {
 });
 
 // ============================================================
-// SPEECH RECOGNITION (INPUT)
+// REAL-TIME AUDIO WORKLET & WEBSOCKET STREAMING (v0.2)
 // ============================================================
 
-function setupRecognition() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    $("micButton").disabled = true;
-    $("micButton").style.opacity = ".55";
-    $("voiceStatus").textContent = "Speech recognition is not available in this browser. Use Chrome or Edge, or test with text.";
+const voiceSessionId = "sess_" + Math.random().toString(36).substring(2, 10);
+let audioContext = null;
+let micStream = null;
+let workletNode = null;
+let voiceSocket = null;
+let activeWsAssistantMessage = null;
+let wsSentenceBuffer = "";
+let wsIsFirstSentence = true;
+
+function connectVoiceSocket() {
+  if (voiceSocket && (voiceSocket.readyState === WebSocket.OPEN || voiceSocket.readyState === WebSocket.CONNECTING)) {
     return;
   }
-  recognition = new SpeechRecognition();
-  recognition.continuous = false;
-  recognition.interimResults = false;
-  recognition.maxAlternatives = 1;
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const wsUrl = `${protocol}//${location.host}/ws/voice/${voiceSessionId}`;
+  voiceSocket = new WebSocket(wsUrl);
+  voiceSocket.binaryType = "arraybuffer";
 
-  recognition.onstart = () => {
-    isListening = true;
-    $("micButton").classList.add("listening");
-    $("micText").textContent = "Listening… click to stop";
-    $("voiceStatus").textContent = "Listening to you. Speak clearly, then pause.";
+  voiceSocket.onopen = () => {
+    $("voiceStatus").textContent = "AudioWorklet connected. Speak into microphone.";
+    // Send initial language configuration
+    voiceSocket.send(JSON.stringify({ action: "set_language", language: $("chatLanguage").value }));
   };
 
-  // Immediate barge-in on speech detection
-  recognition.onspeechstart = () => {
-    if (isSpeaking) {
-      interruptAssistant("Voice detected");
+  voiceSocket.onmessage = (event) => {
+    let msg = null;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+
+    if (msg.event === "speech_started") {
+      speechEndTime = performance.now();
+      // Barge-in: user started speaking, cancel assistant TTS immediately
+      if (isSpeaking) {
+        interruptAssistant("Voice detected");
+      }
+      $("voiceStatus").textContent = "Listening to you speak…";
+    } else if (msg.event === "final_transcript") {
+      speechEndTime = speechEndTime || performance.now();
+      requestStartTime = performance.now();
+      firstTokenTime = 0;
+      addMessage("user", msg.text);
+      $("voiceStatus").textContent = "Processing speech with faster-whisper…";
+    } else if (msg.event === "response_started") {
+      wsSentenceBuffer = "";
+      wsIsFirstSentence = true;
+      activeWsAssistantMessage = addMessage("assistant", "…");
+      $("voiceStatus").textContent = "VoiceDesk is responding…";
+    } else if (msg.event === "text_chunk") {
+      if (!firstTokenTime) {
+        firstTokenTime = performance.now();
+      }
+      if (activeWsAssistantMessage) {
+        if (activeWsAssistantMessage.paragraph.textContent === "…") {
+          activeWsAssistantMessage.paragraph.textContent = "";
+        }
+        activeWsAssistantMessage.paragraph.textContent += msg.content;
+      }
+      wsSentenceBuffer += msg.content;
+
+      // Sentence boundary splitting for natural low-delay speech synthesis
+      const boundaryMatch = wsSentenceBuffer.match(/([.!?।\n]+)(\s+|$)/);
+      if (boundaryMatch) {
+        const splitIdx = wsSentenceBuffer.indexOf(boundaryMatch[0]) + boundaryMatch[0].length;
+        const completeSentence = wsSentenceBuffer.slice(0, splitIdx).trim();
+        wsSentenceBuffer = wsSentenceBuffer.slice(splitIdx);
+        if (completeSentence) {
+          queueSentence(completeSentence, $("chatLanguage").value, wsIsFirstSentence);
+          wsIsFirstSentence = false;
+        }
+      }
+    } else if (msg.event === "response_completed") {
+      if (wsSentenceBuffer.trim()) {
+        queueSentence(wsSentenceBuffer.trim(), $("chatLanguage").value, wsIsFirstSentence);
+        wsSentenceBuffer = "";
+      }
+      if (activeWsAssistantMessage) {
+        activeWsAssistantMessage.paragraph.textContent = msg.answer;
+        const meta = document.createElement("div");
+        meta.className = "meta-badge";
+        if (msg.engine === "llm") {
+          meta.innerHTML = `<span class="engine-pill engine-llm">⚡ LLM (${msg.model || "qwen3:4b"})</span> <span class="source-tag">grounded</span>`;
+        } else {
+          meta.innerHTML = `<span class="engine-pill engine-rule">📋 Rule Engine</span> <span class="source-tag">offline</span>`;
+        }
+        if (msg.response_time_ms) {
+          const latSpan = document.createElement("span");
+          latSpan.className = "source-tag";
+          latSpan.textContent = `· ${Math.round(msg.response_time_ms)}ms`;
+          meta.append(latSpan);
+        }
+        activeWsAssistantMessage.content.append(meta);
+      }
+      $("voiceStatus").textContent = "Response complete. Speak anytime to interrupt.";
+    } else if (msg.event === "interrupted") {
+      interruptAssistant("Barge-in received");
     }
   };
 
-  recognition.onspeechend = () => {
-    // Record exact moment user finishes speaking
-    speechEndTime = performance.now();
+  voiceSocket.onclose = () => {
+    logger?.debug?.("Voice WebSocket closed");
   };
 
-  recognition.onresult = async (event) => {
-    speechEndTime = speechEndTime || performance.now();
-    const transcript = event.results[0][0].transcript;
-    $("chatInput").value = transcript;
-    await sendMessage(transcript, true);
-  };
-
-  recognition.onerror = (event) => {
-    $("voiceStatus").textContent = event.error === "not-allowed"
-      ? "Microphone access denied. Please allow microphone permissions."
-      : `Microphone issue: ${event.error}. You can still use text chat.`;
-  };
-
-  recognition.onend = () => {
-    isListening = false;
-    $("micButton").classList.remove("listening");
-    $("micText").textContent = "Speak to receptionist";
+  voiceSocket.onerror = (err) => {
+    console.warn("Voice WebSocket error:", err);
   };
 }
 
-$("micButton").addEventListener("click", () => {
-  if (!recognition) return;
-  if (isListening) {
-    recognition.stop();
-    return;
-  }
-  // Interrupt if assistant was speaking
-  interruptAssistant("Microphone activated");
-  recognition.lang = $("chatLanguage").value;
+async function startAudioCapture() {
   try {
-    recognition.start();
-  } catch {
-    $("voiceStatus").textContent = "Microphone is busy. Please try again.";
+    interruptAssistant("Starting microphone");
+    connectVoiceSocket();
+
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    await audioContext.audioWorklet.addModule("/static/audio-worklet.js");
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }
+    });
+
+    const source = audioContext.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioContext, "voicedesk-audio-processor");
+
+    workletNode.port.onmessage = (event) => {
+      // event.data is ArrayBuffer of Int16 16kHz PCM
+      if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
+        voiceSocket.send(event.data);
+      }
+    };
+
+    source.connect(workletNode);
+    // Silent sink to prevent feedback
+    const silentGain = audioContext.createGain();
+    silentGain.gain.value = 0;
+    workletNode.connect(silentGain);
+    silentGain.connect(audioContext.destination);
+
+    isListening = true;
+    $("micButton").classList.add("listening");
+    $("micText").textContent = "Streaming mic… click to pause";
+    $("voiceStatus").textContent = "Listening with 16 kHz AudioWorklet. Speak naturally.";
+  } catch (error) {
+    console.warn("AudioWorklet initialization failed, trying browser recognition fallback:", error);
+    $("voiceStatus").textContent = `Audio capture notice: ${error.message}. Testing with text chat.`;
+    stopAudioCapture();
+  }
+}
+
+function stopAudioCapture() {
+  if (micStream) {
+    micStream.getTracks().forEach(track => track.stop());
+    micStream = null;
+  }
+  if (workletNode) {
+    workletNode.disconnect();
+    workletNode = null;
+  }
+  if (audioContext && audioContext.state !== "closed") {
+    audioContext.close();
+    audioContext = null;
+  }
+  isListening = false;
+  $("micButton").classList.remove("listening");
+  $("micText").textContent = "Speak to receptionist";
+  $("voiceStatus").textContent = "Microphone paused. Click to speak again.";
+}
+
+$("micButton").addEventListener("click", async () => {
+  if (isListening) {
+    stopAudioCapture();
+  } else {
+    await startAudioCapture();
   }
 });
 
 $("chatLanguage").addEventListener("change", () => {
   const targetLang = $("chatLanguage").value;
-  if (recognition) recognition.lang = targetLang;
+  if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
+    voiceSocket.send(JSON.stringify({ action: "set_language", language: targetLang }));
+  }
   populateVoices();
 });
 
-// Periodic keepalive for Chrome speech synthesis
-setInterval(() => {
-  if (window.speechSynthesis && window.speechSynthesis.speaking) {
-    window.speechSynthesis.pause();
-    window.speechSynthesis.resume();
+window.addEventListener("beforeunload", () => {
+  stopAudioCapture();
+  interruptAssistant("Page unload");
+  if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
+    voiceSocket.close();
   }
-}, 10000);
-
-window.addEventListener("beforeunload", () => interruptAssistant("Page unload"));
+});
 
 if ("speechSynthesis" in window) {
   window.speechSynthesis.onvoiceschanged = populateVoices;
 }
 
 (async () => {
-  setupRecognition();
   populateVoices();
   await checkHealth();
   try {
@@ -617,3 +733,4 @@ if ("speechSynthesis" in window) {
     $("saveStatus").textContent = error.message;
   }
 })();
+
